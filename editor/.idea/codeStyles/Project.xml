@@ -25,6 +25,7 @@
           <entry key="editor.editor-extensions/gen-query" value="-1" />
           <entry key="editor.editor-extensions/try-with-extension-exceptions" value="-1" />
           <entry key="editor.extensions.luart/with-lock" value="-1" />
+          <entry key="editor.extensions.vm/with-lock" value="-1" />
           <entry key="editor.file-test/with-temp-dir" value="-1" />
           <entry key="editor.file-test/with-temp-dir!" value="-1" />
           <entry key="editor.fs/maybe-silently" value="-1" />
