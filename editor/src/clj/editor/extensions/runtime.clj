@@ -146,8 +146,15 @@
 (defn- writer->print-stream [^Writer writer]
   (PrintStream. (WriterOutputStream. writer StandardCharsets/UTF_8) true StandardCharsets/UTF_8))
 
-(defn- make
-  "Construct fresh Lua runtime for editor scripts"
+(defn make
+  "Construct fresh Lua runtime for editor scripts
+
+  Returned runtime is thread safe and does not block the LuaVM when it executes
+  long-running computations started with suspendable functions.
+
+  Optional kv-args:
+    :out    Writer for the runtime standard output
+    :err    Writer for the runtime error output"
   ^EditorExtensionsRuntime [project & {:keys [out err] :or {out *out* err *err*}}]
   (let [project-path (g/with-auto-evaluation-context evaluation-context
                        (-> project
@@ -200,18 +207,6 @@
     ;; Missing in luaj 3.0.1
     (.set package "config" (str File/separatorChar "\n;\n?\n!\n-"))
 
-    ;; todo this is a test example, move suspending fn construction elsewhere
-    (.set env "resolve_file" (lua-fn [arg]
-                               (vm/->lua (resolve-file project-path (vm/->clj arg vm)))))
-    (.set env "resolve_suspending"
-          (suspendable-fn [arg]
-            (future/completed (suspend-result-success (vm/->lua (resolve-file project-path (vm/->clj arg vm))) false))))
-    (.set env "suspending_fast" (suspendable-fn [& args]
-                                  (future/completed (suspend-result-success (vm/->lua (count args)) false))))
-    (.set env "suspending_slow" (suspendable-fn [& args]
-                                  (future/supply-async
-                                    (Thread/sleep 1000)
-                                    (suspend-result-success (vm/->lua (count args)) false))))
     (EditorExtensionsRuntime.
       vm
       (.get system-coroutine "create")
@@ -285,10 +280,10 @@
 (comment
 
   ;; TODO:
-  ;;   1. Create extensions namespace that creates and configures the runtime
-  ;;   2. Don't rely on project here - move it to extensions ns
-  ;;   3. Create tests for the runtime that ensure that it runs correctly in a
+  ;;   1. Create tests for the runtime that ensure that it runs correctly in a
   ;;      multi-threaded environment
+  ;;   2. Create extensions namespace that creates and configures the runtime
+  ;;   3. Port current implementation
 
   (let [runtime (make (dev/project))
         vm (.-lua-vm runtime)
