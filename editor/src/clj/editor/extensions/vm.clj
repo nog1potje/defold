@@ -17,7 +17,14 @@
 
   Lua VMs are not thread-safe. This namespace defines a set of APIs to
   interact with a Lua VM safely and concurrently using reentrant locks
-  for synchronizing access"
+  for synchronizing access
+
+  An important caveat about locking: coroutines run in their own threads. To
+  prevent deadlocking, we must not lock the VM in the coroutine thread, because
+  at the same time we might be holding a lock in another thread that invoked a
+  Lua script that uses coroutines. The with-lock macro is aware of this and will
+  not actually lock in coroutine threads. We trust luaj coroutines to
+  multi-thread safely in coroutines."
   (:refer-clojure :exclude [eval read])
   (:import [clojure.lang Named]
            [java.io ByteArrayInputStream]
@@ -52,14 +59,21 @@
   [^LuaVM vm]
   (.-lock vm))
 
+(defn must-lock?
+  "Checks if the current thread must lock the VM when interacting with it"
+  []
+  (not (.startsWith (.getName (Thread/currentThread)) "Coroutine-")))
+
 (defmacro with-lock
   "Convenience macro for interacting with a Lua VM under a lock"
   [vm & body]
-  `(let [lock# (lock ~vm)]
-     (try
-       (.lock lock#)
-       (do ~@body)
-       (finally (.unlock lock#)))))
+  `(if (must-lock?)
+     (let [lock# (lock ~vm)]
+       (try
+         (.lock lock#)
+         (do ~@body)
+         (finally (.unlock lock#))))
+     (do ~@body)))
 
 (defn make
   "Create a fresh Lua VM
@@ -71,19 +85,18 @@
 (defn eval
   "Evaluate the Prototype produced by read-string and return resulting LuaValue"
   ^LuaValue [prototype vm]
-  (with-lock vm
-    (.call (LuaClosure. prototype (env vm)))))
+  (with-lock vm (.call (LuaClosure. prototype (env vm)))))
 
 (defn invoke-1
   "Call a lua function while holding a lock on the VM
 
   Return a LuaValue, the first value returned by the function"
-  ([vm ^LuaFunction lua-fn]
+  (^LuaValue [vm ^LuaFunction lua-fn]
    (with-lock vm (.call lua-fn)))
-  ([vm ^LuaFunction lua-fn ^LuaValue lua-value]
+  (^LuaValue [vm ^LuaFunction lua-fn ^LuaValue lua-value]
    (with-lock vm (.call lua-fn lua-value))))
 
-(defn parse-varargs
+(defn unwrap-varargs
   "Converts Lua varargs to a vector of LuaValues"
   [^Varargs varargs]
   ;; varargs are immutable, no need for a lock
@@ -99,11 +112,11 @@
   "Call a lua function while holding a lock on the VM
   Return a vector of all returned LuaValues"
   ([vm ^LuaFunction lua-fn]
-   (parse-varargs (with-lock vm (.invoke lua-fn))))
+   (unwrap-varargs (with-lock vm (.invoke lua-fn))))
   ([vm ^LuaFunction lua-fn ^LuaValue arg-1]
-   (parse-varargs (with-lock vm (.invoke lua-fn arg-1))))
+   (unwrap-varargs (with-lock vm (.invoke lua-fn arg-1))))
   ([vm ^LuaFunction lua-fn ^LuaValue arg-1 ^LuaValue arg-2]
-   (parse-varargs (with-lock vm (.invoke lua-fn arg-1 arg-2)))))
+   (unwrap-varargs (with-lock vm (.invoke lua-fn arg-1 arg-2)))))
 
 (defprotocol ->Lua
   (->lua ^org.luaj.vm2.LuaValue [x]
