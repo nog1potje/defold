@@ -56,8 +56,10 @@
 
 (set! *warn-on-reflection* true)
 
-(deftype EditorExtensionsRuntime [lua-vm coroutine-create coroutine-resume coroutine-status])
+(deftype EditorExtensionsRuntime [lua-vm create resume status])
+
 (deftype Suspend [f varargs])
+
 (deftype SuspendResult [lua-value lua-error refresh-context])
 
 (defn- suspend-result-success
@@ -68,24 +70,29 @@
   [lua-error]
   (SuspendResult. nil lua-error false))
 
-(defn lua-vm
-  [^EditorExtensionsRuntime runtime]
-  (.-lua-vm runtime))
+(defn- suspendable-function
+  "Construct a LuaFunction for a long-running task
 
-(defn- system-coroutine-create
-  "Thread-safe"
-  ^LuaFunction [^EditorExtensionsRuntime runtime]
-  (.-coroutine-create runtime))
-
-(defn- system-coroutine-resume
-  "Not thread-safe"
-  ^LuaFunction [^EditorExtensionsRuntime runtime]
-  (.-coroutine-resume runtime))
-
-(defn- system-coroutine-status
-  "Not thread-safe"
-  ^LuaFunction [^EditorExtensionsRuntime runtime]
-  (.-coroutine-status runtime))
+  Args:
+    yield    system coroutine.yield() LuaFunction function
+    f        Clojure function, will receive LuaValues passed by Lua when an
+             editor script invokes it. Should return a CompletableFuture that
+             will be completed using SuspendResult (see suspend-result-success
+             and suspend-result-error)"
+  ^LuaFunction [^LuaFunction yield f]
+  (DefoldVarArgFn.
+    ;; We must not lock on the LuaVM lock here.
+    ;; If the function is invoked in immediate mode, we will be already holding
+    ;; a lock. If the function is invoked in a suspendable mode, it will be
+    ;; executed on a coroutine thread (and we trust luaj to do it safely) while
+    ;; we are holding the lock in another thread. This means locking here would
+    ;; cause a deadlock!
+    (fn [^Varargs varargs]
+      (let [suspend (Suspend. f varargs)
+            ^SuspendResult result (.userdata ^LuaUserdata (.call yield (vm/->lua suspend)))]
+        (if-let [lua-error (.-lua-error result)]
+          (throw lua-error)
+          (.-lua-value result))))))
 
 (def ^:private ^:dynamic *execution-context*
   "A map with following keys:
@@ -113,8 +120,8 @@
 (defn- writer->print-stream [^Writer writer]
   (PrintStream. (WriterOutputStream. writer StandardCharsets/UTF_8) true StandardCharsets/UTF_8))
 
-(defn- make [project & {:keys [out err]
-                        :or {out *out* err *err*}}]
+(defn- make
+  ^EditorExtensionsRuntime [project & {:keys [out err] :or {out *out* err *err*}}]
   (let [project-path (g/with-auto-evaluation-context evaluation-context
                        (-> project
                            (project/workspace evaluation-context)
@@ -160,17 +167,19 @@
     (.set package "config" (str File/separatorChar "\n;\n?\n!\n-"))
 
     ;; todo this is a test example, move suspending fn construction elsewhere
-    (.set env "suspending" (DefoldVarArgFn.
-                             ;; Don't lock on the vm here! coroutine runs in the luaj-managed
-                             ;; coroutine thread, we trust luaj to do their job
-                             (fn [^Varargs varargs]
-                               (let [f (fn [& args]
-                                         ;; my example suspend fn
-                                         (future/completed (suspend-result-success (first args) false)))]
-                                 (let [^SuspendResult result (.userdata ^LuaUserdata (.call yield (vm/->lua (Suspend. f varargs))))]
-                                   (if-let [lua-error (.-lua-error result)]
-                                     (throw lua-error)
-                                     (.-lua-value result)))))))
+    (.set env "resolve_file" (DefoldVarArgFn. (fn [varags]
+                                                (vm/->lua (resolve-file project-path (vm/->clj (first (vm/parse-varargs varags))
+                                                                                               vm))))))
+    (.set env "suspending_fast" (suspendable-function
+                                  yield
+                                  (fn [& args]
+                                    (future/completed (suspend-result-success (vm/->lua (count args)) false)))))
+    (.set env "suspending_slow" (suspendable-function
+                                  yield
+                                  (fn [& args]
+                                    (future/supply-async
+                                      (Thread/sleep 1000)
+                                      (suspend-result-success (vm/->lua (count args)) false)))))
     (EditorExtensionsRuntime.
       vm
       (.get system-coroutine "create")
@@ -201,14 +210,14 @@
                       (invoke-suspending-impl execution-context vm resume status co (vm/->lua result))))))))
         (future/failed (LuaError. ^String (vm/->clj lua-ret vm)))))))
 
-
-(defn invoke-suspending [runtime ^LuaFunction lua-fn ^LuaValue lua-value]
+(defn invoke-suspending
+  [^EditorExtensionsRuntime runtime ^LuaFunction lua-fn ^LuaValue lua-value]
   {:pre [(validation/lua-fn? lua-fn)
          (validation/lua-value? lua-value)]}
-  (let [co (.call (system-coroutine-create runtime) lua-fn)
-        resume (system-coroutine-resume runtime)
-        status (system-coroutine-status runtime)
-        vm (lua-vm runtime)
+  (let [co (.call ^LuaFunction (.-create runtime) lua-fn)
+        resume (.-resume runtime)
+        status (.-status runtime)
+        vm (.-lua-vm runtime)
         execution-context {:evaluation-context (g/make-evaluation-context)}]
     (invoke-suspending-impl execution-context vm resume status co lua-value)))
 
@@ -219,17 +228,16 @@
   ([runtime lua-fn lua-value]
    (g/with-auto-evaluation-context evaluation-context
      (invoke-immediate runtime lua-fn lua-value evaluation-context)))
-  ([runtime lua-fn lua-value evaluation-context]
+  ([^EditorExtensionsRuntime runtime lua-fn lua-value evaluation-context]
    (binding [*execution-context* {:evaluation-context evaluation-context}]
      (try
-       (vm/invoke-1 (lua-vm runtime) lua-fn lua-value)
+       (vm/invoke-1 (.-lua-vm runtime) lua-fn lua-value)
        (catch LuaError ex
          (let [msg (.getMessage ex)]
            (if (string/ends-with? msg cannot-suspend-error-suffix)
              (throw (LuaError. (str (subs msg 0 (- (.length msg) (.length cannot-suspend-error-suffix)))
                                     "cannot use long-running editor function in this context")))
              (throw ex))))))))
-
 
 (comment
 
@@ -242,23 +250,43 @@
   ;;   when needs to do async tasks
   ;;   if exception is a lua error, treat it as editor script errors
   ;; todo document suspend function construction
-  ;;   must return a future that will receive SuspendResult
   ;;   if throws, lua errors are treated as editor script errors
   ;;   - I will finish editor extensions porting later
 
+
+
+  ;; TODO: we might want to use ->clj from withing the API functions called from
+  ;;       the coroutine. therefore, we must not lock!
+
+
+
+
+
+  ;; TODO wait... what if I use editor.get (i.e. access execution context)
+  ;;      in a suspendable context? it's running in a coroutine thread....
+  ;;      FIXME THIS IS A REAL PROBLEM!!111
+  ;;            what if, instead of running everything in a coroutine, we
+  ;;            only run the actual suspendable functions in a coroutines???
+
   (let [runtime (make (dev/project))
-        vm (lua-vm runtime)
-        lua-fn (-> (vm/read "return function(x) return suspending('foo') end")
-                   (vm/eval vm))]
-    (time
-      (dotimes [_ 1000]
-        @(invoke-suspending runtime lua-fn (vm/->lua 4))))
-    (vm/->clj @(invoke-suspending runtime lua-fn (vm/->lua 4)) vm))
+        vm (.-lua-vm runtime)
+        slow-lua-fn (-> (vm/read "glob = 1 return function(x) local r = suspending_slow('foo', x, true) print(glob) return r end")
+                        (vm/eval vm))
+        fast-lua-fn (-> (vm/read "return function(x) glob = glob + 1 return x end")
+                        (vm/eval vm))
+        slow (invoke-suspending runtime slow-lua-fn (vm/->lua 4))]
+    (dotimes [_ 100]
+      (future
+        (dotimes [_ 100000]
+          (invoke-immediate runtime fast-lua-fn (vm/->lua 4)))))
+    (tap> [:slow (vm/->clj (time @slow) vm)]))
+
+  (System/gc)
 
   (double (/ 80 1000)) ;; suspending: 0.08 ms per noop
 
   (let [runtime (make (dev/project))
-        vm (lua-vm runtime)
+        vm (.-lua-vm runtime)
         lua-fn (-> (vm/read "return function(x) return true end")
                    (vm/eval vm))]
     (time
@@ -266,15 +294,12 @@
         (dotimes [_ 1000000]
           (invoke-immediate runtime lua-fn (vm/->lua 4) ec)))))
 
-  (format "%f"(double (/ 400 1000000))) ;; 0.0004ms per noop
+  (format "%f" (double (/ 400 1000000))) ;; 0.0004ms per noop
 
   (let [runtime (make (dev/project))
-        vm (lua-vm runtime)
-        lua-fn (-> (vm/read "return function(x) return {1, 2, 3, x} end")
+        vm (.-lua-vm runtime)
+        lua-fn (-> (vm/read "return function(x) return require(x) end")
                    (vm/eval vm))]
-    (time
-      (g/with-auto-evaluation-context ec
-        (dotimes [_ 1000000]
-          (invoke-immediate runtime lua-fn (vm/->lua 4) ec)))))
+    @(invoke-suspending runtime lua-fn (vm/->lua "ext.other")))
 
   #__)

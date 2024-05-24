@@ -95,11 +95,6 @@
         (let [next-i (inc i)]
           (recur (conj! acc (.arg varargs next-i)) next-i))))))
 
-(defn wrap-userdata
-  "Wraps any value in LuaUserdata"
-  [x]
-  (LuaValue/userdataOf x))
-
 (defn invoke-all
   "Call a lua function while holding a lock on the VM
   Return a vector of all returned LuaValues"
