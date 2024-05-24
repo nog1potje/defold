@@ -23,9 +23,9 @@
   the editor scripts attempt to perform a long-running computation, the
   Lua code execution suspends and returns control back to the editor. The editor
   then schedules the computation and, once it's done, resumes the execution.
-  This runtime also splits coroutine into 2 contexts: 'user' and 'system'. With
-  this split, editor-related suspends are transparent to the editor script, so
-  the editor script may still use coroutines internally without interfering with
+  This runtime splits coroutine into 2 contexts: 'user' and 'system'. With this
+  split, editor-related suspends are invisible to the editor script, so the
+  editor script may still use coroutines internally without interfering with
   the editor.
 
   This namespace defines 2 ways to run Lua code:
@@ -56,53 +56,78 @@
 
 (deftype EditorExtensionsRuntime [lua-vm create resume status yield])
 
-(deftype Suspend [f varargs])
+(deftype Suspend [f args])
 
 (deftype SuspendResult [lua-value lua-error refresh-context])
 
-(defn- suspend-result-success
-  [lua-value refresh-context]
-  (SuspendResult. lua-value nil refresh-context))
-
-(defn- suspend-result-error
-  [lua-error]
-  (SuspendResult. nil lua-error false))
-
-(def ^:private ^:dynamic *execution-context*
-  "A map with following keys:
+(defn current-execution-context
+  "Returns the current execution context, a map with following keys:
     :evaluation-context    the evaluation context for this execution
     :runtime               the EditorExtensionsRuntime used for execution
     :mode                  :suspendable or :immediate"
-  nil)
-
-(def ^:private coronest-prototype
-  (vm/read (slurp (io/resource "coronest.lua")) "coronest.lua"))
-
-(defn- current-execution-context []
+  []
   {:pre [(some? *execution-context*)]}
   *execution-context*)
 
-(defn- suspendable-function
-  "Construct a LuaFunction for a long-running task
-
-  Args:
-    f        Clojure function, will receive LuaValues passed by Lua when an
-             editor script invokes it. Should return a CompletableFuture that
-             will be completed using SuspendResult (see suspend-result-success
-             and suspend-result-error)"
+(defn- wrap-suspendable-function
   ^LuaFunction [f]
   (DefoldVarArgFn.
-    (fn [varargs]
+    (fn [& args]
       (let [ctx (current-execution-context)]
         (if (= :immediate (:mode ctx))
           (throw (LuaError. "Cannot use long-running editor function in immediate context")))
         (let [^EditorExtensionsRuntime runtime (:runtime ctx)
               vm (.-lua-vm runtime)
-              suspend (Suspend. f varargs)
+              suspend (Suspend. f args)
               ^SuspendResult result (vm/->clj (vm/invoke-1 vm (.-yield runtime) (vm/->lua suspend)) vm)]
           (if-let [lua-error (.-lua-error result)]
             (throw lua-error)
             (.-lua-value result)))))))
+
+
+(defn- suspend-result-success
+  "Construct a successful SuspendResult with a resulting value
+
+  Args:
+    lua-value          LuaValue returned to the editor script that called a
+                       suspendable function
+    refresh-context    boolean flag indicating whether the runtime needs to
+                       refresh the evaluation context for subsequent Lua
+                       execution"
+  [lua-value refresh-context]
+  (SuspendResult. lua-value nil refresh-context))
+
+(defn- suspend-result-error
+  "Construct a failed SuspendResult
+
+  Args:
+    lua-error    LuaError value that will be thrown as a result of editor script
+                 calling a suspendable function"
+  [lua-error]
+  (SuspendResult. nil lua-error false))
+
+(defmacro suspendable-fn
+  "Defines a suspendable Lua function
+
+  The function will receive LuaValue args that were passed by the editor script.
+  It must return a future that will eventually be completed with SuspendResult
+  (see suspend-result-success and suspend-result-error).
+
+  Returned function will be executed in an execution context that can be
+  accessed using current-execution-context fn"
+  [& fn-tail]
+  `(wrap-suspendable-function (fn ~@fn-tail)))
+
+(defmacro lua-fn
+  "Defines a regular Lua function
+
+  The function will receive LuaValue args that were passed by the editor script.
+  It must return LuaValue (or Varargs) that will be returned back to the script.
+
+  Returned function will be executed in an execution context that can be
+  accessed using current-execution-context fn"
+  [& fn-tail]
+  `(DefoldVarArgFn. (fn ~@fn-tail)))
 
 (defn- find-resource [project resource-path]
   (let [evaluation-context (:evaluation-context (current-execution-context))]
@@ -115,10 +140,14 @@
       (str target-path)
       (throw (LuaError. (format "Can't open %s: outside of project directory" file-path))))))
 
+(def ^:private coronest-prototype
+  (vm/read (slurp (io/resource "coronest.lua")) "coronest.lua"))
+
 (defn- writer->print-stream [^Writer writer]
   (PrintStream. (WriterOutputStream. writer StandardCharsets/UTF_8) true StandardCharsets/UTF_8))
 
 (defn- make
+  "Construct fresh Lua runtime for editor scripts"
   ^EditorExtensionsRuntime [project & {:keys [out err] :or {out *out* err *err*}}]
   (let [project-path (g/with-auto-evaluation-context evaluation-context
                        (-> project
@@ -152,6 +181,7 @@
         ;; properly set.
         _ (-> env (.get "coroutine") (.set "create" (DefoldCoroutineCreate. env)))
 
+        ;; Now we split the coroutine into 2 contexts
         coronest (vm/eval coronest-prototype vm)
         user-coroutine (vm/invoke-1 vm coronest (vm/->lua "user"))
         system-coroutine (vm/invoke-1 vm coronest (vm/->lua "system"))]
@@ -171,22 +201,17 @@
     (.set package "config" (str File/separatorChar "\n;\n?\n!\n-"))
 
     ;; todo this is a test example, move suspending fn construction elsewhere
-    (.set env "resolve_file" (DefoldVarArgFn. (fn [varags]
-                                                (vm/->lua (resolve-file project-path (vm/->clj (first (vm/unwrap-varargs varags))
-                                                                                               vm))))))
+    (.set env "resolve_file" (lua-fn [arg]
+                               (vm/->lua (resolve-file project-path (vm/->clj arg vm)))))
     (.set env "resolve_suspending"
-          (suspendable-function (fn [arg]
-                                  (future/completed
-                                    (suspend-result-success (vm/->lua (resolve-file project-path (vm/->clj arg vm)))
-                                                            false)))))
-    (.set env "suspending_fast" (suspendable-function
-                                  (fn [& args]
-                                    (future/completed (suspend-result-success (vm/->lua (count args)) false)))))
-    (.set env "suspending_slow" (suspendable-function
-                                  (fn [& args]
-                                    (future/supply-async
-                                      (Thread/sleep 1000)
-                                      (suspend-result-success (vm/->lua (count args)) false)))))
+          (suspendable-fn [arg]
+            (future/completed (suspend-result-success (vm/->lua (resolve-file project-path (vm/->clj arg vm))) false))))
+    (.set env "suspending_fast" (suspendable-fn [& args]
+                                  (future/completed (suspend-result-success (vm/->lua (count args)) false))))
+    (.set env "suspending_slow" (suspendable-fn [& args]
+                                  (future/supply-async
+                                    (Thread/sleep 1000)
+                                    (suspend-result-success (vm/->lua (count args)) false))))
     (EditorExtensionsRuntime.
       vm
       (.get system-coroutine "create")
@@ -205,7 +230,7 @@
           (future/completed lua-ret)
           (let [^Suspend suspend (vm/->clj lua-ret vm)]
             (-> (try
-                  (apply (.-f suspend) (vm/unwrap-varargs (.-varargs suspend)))
+                  (apply (.-f suspend) (.-args suspend))
                   (catch LuaError e (future/completed (suspend-result-error e)))
                   (catch Throwable e (future/failed e)))
                 (future/then-compose-async
@@ -225,6 +250,15 @@
         (future/failed (LuaError. ^String (vm/->clj lua-ret vm)))))))
 
 (defn invoke-suspending
+  "Invoke a potentially long-running LuaFunction
+
+  Returns a CompletableFuture that will be either completed normally with the
+  returned LuaValue or exceptionally. If exception is LuaError, treat it as a
+  script error. Otherwise, treat it as editor error.
+
+  Runtime will start invoking the LueFunction on the calling thread, then will
+  move the execution to background threads if necessary. This means that
+  invoke-suspending might return a completed CompletableFuture"
   [^EditorExtensionsRuntime runtime lua-fn lua-value]
   (let [co (vm/invoke-1 (.-lua-vm runtime) (.-create runtime) lua-fn)
         execution-context {:evaluation-context (g/make-evaluation-context)
@@ -233,6 +267,12 @@
     (invoke-suspending-impl execution-context runtime co lua-value)))
 
 (defn invoke-immediate
+  "Invoke a short-running LuaFunction
+
+  Returns the result LuaValue. No calls to suspending functions are allowed
+  during this invocation. Calling this function might throw an exception. If the
+  exception is LuaError, treat is a script error. Otherwise, treat it as editor
+  error."
   ([runtime lua-fn lua-value]
    (g/with-auto-evaluation-context evaluation-context
      (invoke-immediate runtime lua-fn lua-value evaluation-context)))
@@ -244,14 +284,12 @@
 
 (comment
 
-  ;; TODO
-  ;;   - documentations
-  ;; todo document semantics:
-  ;;   semantics:
-  ;;   returns a CompletionStage, i.e. eventually this will either fail or succeed.
-  ;;   starts execution on the calling thread, then switches to background thread
-  ;;   when needs to do async tasks
-  ;;   if exception is a lua error, treat it as editor script errors
+  ;; TODO:
+  ;;   1. Create extensions namespace that creates and configures the runtime
+  ;;   2. Don't rely on project here - move it to extensions ns
+  ;;   3. Create tests for the runtime that ensure that it runs correctly in a
+  ;;      multi-threaded environment
+
   (let [runtime (make (dev/project))
         vm (.-lua-vm runtime)
         slow-lua-fn (-> (vm/read "glob = 1 return function(x) local r = suspending_slow('foo', x, true) print(glob) return r end")
