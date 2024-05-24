@@ -44,7 +44,7 @@
             [editor.extensions.vm :as vm]
             [editor.future :as future]
             [editor.workspace :as workspace])
-  (:import [com.defold.editor.luart DefoldBaseLib DefoldIoLib DefoldVarArgFn SearchPath]
+  (:import [com.defold.editor.luart DefoldBaseLib DefoldCoroutineCreate DefoldIoLib DefoldVarArgFn SearchPath]
            [java.io File PrintStream Writer]
            [java.nio.charset StandardCharsets]
            [java.nio.file Path]
@@ -71,6 +71,7 @@
   (SuspendResult. nil lua-error false))
 
 (defn- suspendable-function
+  ;; todo now suspendable function is invoked in context! we can get yield from there!
   "Construct a LuaFunction for a long-running task
 
   Args:
@@ -107,6 +108,7 @@
   (:evaluation-context *execution-context*))
 
 (defn- find-resource [project resource-path]
+  (tap> [(Thread/currentThread) (some? *execution-context*) resource-path])
   (let [evaluation-context (current-evaluation-context)]
     (when-let [node (project/get-resource-node project (str "/" resource-path) evaluation-context)]
       (data/lines-input-stream (g/node-value node :lines evaluation-context)))))
@@ -147,6 +149,12 @@
               (-> .-STDOUT (set! (writer->print-stream out)))
               (-> .-STDERR (set! (writer->print-stream err))))
         package (.get env "package")
+        ;; Before splitting the coroutine module into 2 contexts (user and
+        ;; system), we override the coroutine.create() function with a one that
+        ;; conveys the thread bindings to the coroutine thread. This way, both
+        ;; in system and user coroutines, the *execution-context* var will be
+        ;; properly set.
+        _ (-> env (.get "coroutine") (.set "create" (DefoldCoroutineCreate. env)))
         coronest (.call (LuaClosure. coronest-prototype env))
         user-coroutine (.call coronest "user")
         system-coroutine (.call coronest "system")
@@ -170,6 +178,11 @@
     (.set env "resolve_file" (DefoldVarArgFn. (fn [varags]
                                                 (vm/->lua (resolve-file project-path (vm/->clj (first (vm/parse-varargs varags))
                                                                                                vm))))))
+    (.set env "resolve_suspending"
+          (suspendable-function yield (fn [arg]
+                                        (future/completed
+                                          (suspend-result-success (vm/->lua (resolve-file project-path (vm/->clj arg vm)))
+                                                                  false)))))
     (.set env "suspending_fast" (suspendable-function
                                   yield
                                   (fn [& args]
@@ -258,16 +271,6 @@
   ;; TODO: we might want to use ->clj from withing the API functions called from
   ;;       the coroutine. therefore, we must not lock!
 
-
-
-
-
-  ;; TODO wait... what if I use editor.get (i.e. access execution context)
-  ;;      in a suspendable context? it's running in a coroutine thread....
-  ;;      FIXME THIS IS A REAL PROBLEM!!111
-  ;;            what if, instead of running everything in a coroutine, we
-  ;;            only run the actual suspendable functions in a coroutines???
-
   (let [runtime (make (dev/project))
         vm (.-lua-vm runtime)
         slow-lua-fn (-> (vm/read "glob = 1 return function(x) local r = suspending_slow('foo', x, true) print(glob) return r end")
@@ -298,8 +301,12 @@
 
   (let [runtime (make (dev/project))
         vm (.-lua-vm runtime)
-        lua-fn (-> (vm/read "return function(x) return require(x) end")
+        lua-fn (-> (vm/read "return function(x)
+                               local co = coroutine.create(resolve_suspending)
+                               local s,v = coroutine.resume(co, x)
+                               return {s,v}
+                             end")
                    (vm/eval vm))]
-    @(invoke-suspending runtime lua-fn (vm/->lua "ext.other")))
+    @(invoke-suspending runtime lua-fn (vm/->lua "ext/other.lua")))
 
   #__)
