@@ -38,12 +38,10 @@
 
 (defn read
   "Read a string with a chunk of lua code and return a Prototype for eval"
-  (^Prototype [chunk]
-   (read chunk "REPL"))
-  (^Prototype [chunk chunk-name]
-   (.compile LuaC/instance
-             (ByteArrayInputStream. (.getBytes ^String chunk StandardCharsets/UTF_8))
-             chunk-name)))
+  ^Prototype [chunk chunk-name]
+  (.compile LuaC/instance
+            (ByteArrayInputStream. (.getBytes ^String chunk StandardCharsets/UTF_8))
+            chunk-name))
 
 (deftype LuaVM [env lock])
 
@@ -83,24 +81,26 @@
   (LuaVM. (Globals.) (ReentrantLock.)))
 
 (defn eval
-  "Evaluate the Prototype produced by read-string and return resulting LuaValue"
+  "Evaluate the Prototype produced by read and return resulting LuaValue"
   ^LuaValue [prototype vm]
   (with-lock vm (.call (LuaClosure. prototype (env vm)))))
+
+(defn- invoke ^Varargs [vm ^LuaFunction lua-fn args]
+  (with-lock vm (.invoke lua-fn (LuaValue/varargsOf (into-array LuaValue args)))))
 
 (defn invoke-1
   "Call a lua function while holding a lock on the VM
 
   Return a LuaValue, the first value returned by the function"
-  (^LuaValue [vm ^LuaFunction lua-fn]
-   (with-lock vm (.call lua-fn)))
-  (^LuaValue [vm ^LuaFunction lua-fn ^LuaValue lua-value]
-   (with-lock vm (.call lua-fn lua-value))))
+  ^LuaValue [vm lua-fn & lua-args]
+  (.arg1 (invoke vm lua-fn lua-args)))
 
-(defn unwrap-varargs
-  "Converts Lua varargs to a vector of LuaValues"
-  [^Varargs varargs]
-  ;; varargs are immutable, no need for a lock
-  (let [n (.narg varargs)]
+(defn invoke-all
+  "Call a lua function while holding a lock on the VM
+  Return a vector of all returned LuaValues"
+  [vm ^LuaFunction lua-fn & lua-args]
+  (let [varargs (invoke vm lua-fn lua-args)
+        n (.narg varargs)]
     (loop [acc (transient [])
            i 0]
       (if (= n i)
@@ -108,30 +108,11 @@
         (let [next-i (inc i)]
           (recur (conj! acc (.arg varargs next-i)) next-i))))))
 
-(defn invoke-all
-  "Call a lua function while holding a lock on the VM
-  Return a vector of all returned LuaValues"
-  ([vm ^LuaFunction lua-fn]
-   (unwrap-varargs (with-lock vm (.invoke lua-fn))))
-  ([vm ^LuaFunction lua-fn ^LuaValue arg-1]
-   (unwrap-varargs (with-lock vm (.invoke lua-fn arg-1))))
-  ([vm ^LuaFunction lua-fn ^LuaValue arg-1 ^LuaValue arg-2]
-   (unwrap-varargs (with-lock vm (.invoke lua-fn arg-1 arg-2)))))
-
 (defprotocol ->Lua
-  (->lua ^org.luaj.vm2.LuaValue [x]
-    "Convert Clojure data structure to Lua data structure"))
+  (->lua [x]))
 
 (defprotocol ->Clj
-  (->clj [lua-value vm]
-    "Convert Lua data structure to Clojure data structure
-
-    Might lock the VM while deserializing tables
-    Converts tables either to:
-    - vectors, if not empty and all keys are positive ints
-    - maps, otherwise. string keys are converted to keywords
-
-    Preserves LuaThread, File (from IoLib) and LuaFunction"))
+  (->clj [lua-value vm]))
 
 (extend-protocol ->Lua
   nil (->lua [_] LuaValue/NIL)
@@ -143,6 +124,47 @@
   Named (->lua [x] (LuaValue/valueOf (.getName x)))
   List (->lua [x] (LuaValue/listOf (into-array LuaValue (mapv ->lua x))))
   Map (->lua [x] (LuaValue/tableOf (into-array LuaValue (into [] (comp cat (map ->lua)) x)))))
+
+(defn- lua-table->clj-map-or-vector [^LuaTable table vm]
+  (loop [prev-k LuaValue/NIL
+         acc-v nil
+         acc-m nil]
+    (let [varargs (.next table prev-k)
+          lua-k (.arg1 varargs)]
+      (if (.isnil lua-k)
+        (or (some-> acc-v persistent!)
+            (some-> acc-m persistent!)
+            {})
+        (let [lua-v (.arg varargs 2)
+              clj-k (->clj lua-k vm)
+              clj-v (->clj lua-v vm)]
+          (cond
+            acc-m
+            (recur lua-k nil (assoc! acc-m (cond-> clj-k (string? clj-k) keyword) clj-v))
+
+            (pos-int? clj-k)                   ;; grow acc-v
+            (let [acc-v (or acc-v (transient []))
+                  i (dec clj-k)                ;; 1-indexed to 0-indexed
+                  acc-v (loop [acc-v acc-v]
+                          (if (< (count acc-v) i)
+                            (recur (conj! acc-v nil))
+                            acc-v))]
+              (recur lua-k (assoc! acc-v i clj-v) nil))
+
+            :else                              ;; convert to map
+            (let [acc-m (transient {(cond-> clj-k (string? clj-k) keyword) clj-v})
+                  acc-m (if acc-v
+                          (let [len (count acc-v)]
+                            (loop [i 0
+                                   acc-m acc-m]
+                              (if (= i len)
+                                acc-m
+                                (let [v (acc-v i)]
+                                  (if (nil? v)
+                                    (recur (inc i) acc-m)
+                                    (recur (inc i) (assoc! acc-m (inc i) v)))))))
+                          acc-m)]
+              (recur lua-k nil acc-m))))))))
 
 (extend-protocol ->Clj
   ;; Class hierarchy:
@@ -168,43 +190,4 @@
   LuaInteger (->clj [x _] (.tolong x))
   LuaTable (->clj [table vm]
              ;; only hold the lock for the mutable lua table access
-             (with-lock vm
-               (loop [prev-k LuaValue/NIL
-                      acc-v nil
-                      acc-m nil]
-                 (let [varargs (.next table prev-k)
-                       lua-k (.arg1 varargs)]
-                   (if (.isnil lua-k)
-                     (or (some-> acc-v persistent!)
-                         (some-> acc-m persistent!)
-                         {})
-                     (let [lua-v (.arg varargs 2)
-                           clj-k (->clj lua-k vm)
-                           clj-v (->clj lua-v vm)]
-                       (cond
-                         acc-m
-                         (recur lua-k nil (assoc! acc-m (cond-> clj-k (string? clj-k) keyword) clj-v))
-
-                         (pos-int? clj-k)                   ;; grow acc-v
-                         (let [acc-v (or acc-v (transient []))
-                               i (dec clj-k)                ;; 1-indexed to 0-indexed
-                               acc-v (loop [acc-v acc-v]
-                                       (if (< (count acc-v) i)
-                                         (recur (conj! acc-v nil))
-                                         acc-v))]
-                           (recur lua-k (assoc! acc-v i clj-v) nil))
-
-                         :else                              ;; convert to map
-                         (let [acc-m (transient {(cond-> clj-k (string? clj-k) keyword) clj-v})
-                               acc-m (if acc-v
-                                       (let [len (count acc-v)]
-                                         (loop [i 0
-                                                acc-m acc-m]
-                                           (if (= i len)
-                                             acc-m
-                                             (let [v (acc-v i)]
-                                               (if (nil? v)
-                                                 (recur (inc i) acc-m)
-                                                 (recur (inc i) (assoc! acc-m (inc i) v)))))))
-                                       acc-m)]
-                           (recur lua-k nil acc-m))))))))))
+             (with-lock vm (lua-table->clj-map-or-vector table vm))))

@@ -14,35 +14,25 @@
 
 package com.defold.editor.luart;
 
-
 import clojure.lang.Var;
 import clojure.lang.Volatile;
 import org.luaj.vm2.Globals;
-import org.luaj.vm2.LuaFunction;
+import org.luaj.vm2.LuaThread;
 import org.luaj.vm2.LuaValue;
 import org.luaj.vm2.Varargs;
-import org.luaj.vm2.lib.OneArgFunction;
-import org.luaj.vm2.lib.VarArgFunction;
 
-public class DefoldCoroutineCreate extends OneArgFunction {
+public class DefoldLuaThread extends LuaThread {
 
-    private final Globals globals;
+    public final Volatile threadBindings;
 
-    public DefoldCoroutineCreate(Globals globals) {
-        this.globals = globals;
+    public DefoldLuaThread(Volatile threadBindings, Globals globals, LuaValue func) {
+        super(globals, func);
+        this.threadBindings = threadBindings;
     }
 
     @Override
-    public LuaValue call(LuaValue arg) {
-        LuaFunction func = arg.checkfunction();
-        Volatile vol = new Volatile(null);
-        VarArgFunction threadBoundFunc = new VarArgFunction() {
-            @Override
-            public Varargs invoke(Varargs args) {
-                Var.resetThreadBindingFrame(vol.deref());
-                return func.invoke(args);
-            }
-        };
-        return new DefoldLuaThread(vol, globals, threadBoundFunc);
+    public Varargs resume(Varargs args) {
+        threadBindings.reset(Var.cloneThreadBindingFrame());
+        return super.resume(args);
     }
 }

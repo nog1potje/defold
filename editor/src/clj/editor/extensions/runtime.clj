@@ -34,6 +34,7 @@
     2. invoke-immediate - call the LuaFunction with suspendable functions
        defined by the editor disabled. This way there is no coroutine overhead,
        and code executes significantly faster."
+  (:refer-clojure :exclude [read eval])
   (:require [cljfx.api :as fx]
             [clojure.java.io :as io]
             [dynamo.graph :as g]
@@ -42,12 +43,13 @@
             [editor.extensions.vm :as vm]
             [editor.future :as future]
             [editor.workspace :as workspace])
-  (:import [com.defold.editor.luart DefoldBaseLib DefoldCoroutineCreate DefoldIoLib DefoldVarArgFn SearchPath]
+  (:import [clojure.lang Var]
+           [com.defold.editor.luart DefoldBaseLib DefoldCoroutineCreate DefoldCoroutineYield DefoldIoLib DefoldVarArgFn SearchPath]
            [java.io File PrintStream Writer]
            [java.nio.charset StandardCharsets]
            [java.nio.file Path]
            [org.apache.commons.io.output WriterOutputStream]
-           [org.luaj.vm2 LoadState LuaError LuaFunction]
+           [org.luaj.vm2 LoadState LuaError LuaFunction LuaTable LuaValue]
            [org.luaj.vm2.compiler LuaC]
            [org.luaj.vm2.lib Bit32Lib CoroutineLib PackageLib PackageLib$lua_searcher PackageLib$preload_searcher StringLib TableLib]
            [org.luaj.vm2.lib.jse JseMathLib JseOsLib]))
@@ -60,6 +62,25 @@
 
 (deftype SuspendResult [lua-value lua-error refresh-context])
 
+(defn ->lua
+  "Convert Clojure data structure to Lua data structure"
+  ^LuaValue [x]
+  (vm/->lua x))
+
+(defn ->clj
+  "Convert Lua data structure to Clojure data structure
+
+  Might lock the runtime Lua VM while deserializing tables
+  Converts tables either to:
+  - vectors, if not empty and all keys are positive ints
+  - maps, otherwise. string keys are converted to keywords
+
+  Preserves LuaThread, File (from IoLib) and LuaFunction"
+  [^EditorExtensionsRuntime runtime lua-value]
+  (vm/->clj lua-value (.-lua-vm runtime)))
+
+(def ^:private ^:dynamic *execution-context* nil)
+
 (defn current-execution-context
   "Returns the current execution context, a map with following keys:
     :evaluation-context    the evaluation context for this execution
@@ -69,7 +90,7 @@
   {:pre [(some? *execution-context*)]}
   *execution-context*)
 
-(defn- wrap-suspendable-function
+(defn wrap-suspendable-function
   ^LuaFunction [f]
   (DefoldVarArgFn.
     (fn [& args]
@@ -79,13 +100,13 @@
         (let [^EditorExtensionsRuntime runtime (:runtime ctx)
               vm (.-lua-vm runtime)
               suspend (Suspend. f args)
-              ^SuspendResult result (vm/->clj (vm/invoke-1 vm (.-yield runtime) (vm/->lua suspend)) vm)]
+              ^SuspendResult result (->clj runtime (vm/invoke-1 vm (.-yield runtime) (->lua suspend)))]
           (if-let [lua-error (.-lua-error result)]
             (throw lua-error)
             (.-lua-value result)))))))
 
 
-(defn- suspend-result-success
+(defn suspend-result-success
   "Construct a successful SuspendResult with a resulting value
 
   Args:
@@ -97,7 +118,7 @@
   [lua-value refresh-context]
   (SuspendResult. lua-value nil refresh-context))
 
-(defn- suspend-result-error
+(defn suspend-result-error
   "Construct a failed SuspendResult
 
   Args:
@@ -106,7 +127,7 @@
   [lua-error]
   (SuspendResult. nil lua-error false))
 
-(defmacro suspendable-fn
+(defmacro suspendable-lua-fn
   "Defines a suspendable Lua function
 
   The function will receive LuaValue args that were passed by the editor script.
@@ -140,11 +161,34 @@
       (str target-path)
       (throw (LuaError. (format "Can't open %s: outside of project directory" file-path))))))
 
+(defn read
+  "Read a string with a chunk of lua code and return a Prototype for eval"
+  ([chunk]
+   (vm/read chunk "REPL"))
+  ([chunk chunk-name]
+   (vm/read chunk chunk-name)))
+
 (def ^:private coronest-prototype
-  (vm/read (slurp (io/resource "coronest.lua")) "coronest.lua"))
+  (read (slurp (io/resource "coronest.lua")) "coronest.lua"))
+
+(defn eval
+  "Evaluate the Prototype produced by read and return resulting LuaValue"
+  ^LuaValue [^EditorExtensionsRuntime runtime prototype]
+  (vm/eval prototype (.-lua-vm runtime)))
 
 (defn- writer->print-stream [^Writer writer]
   (PrintStream. (WriterOutputStream. writer StandardCharsets/UTF_8) true StandardCharsets/UTF_8))
+
+(defn- merge-env-impl! [globals m]
+  (reduce-kv
+    (fn [^LuaValue acc k v]
+      (let [lua-key (->lua k)
+            old-lua-val (.get acc lua-key)]
+        (if (and (map? v) (.istable old-lua-val))
+          (merge-env-impl! old-lua-val v)
+          (doto acc (.set lua-key (->lua v))))))
+    globals
+    m))
 
 (defn make
   "Construct fresh Lua runtime for editor scripts
@@ -154,8 +198,9 @@
 
   Optional kv-args:
     :out    Writer for the runtime standard output
-    :err    Writer for the runtime error output"
-  ^EditorExtensionsRuntime [project & {:keys [out err] :or {out *out* err *err*}}]
+    :err    Writer for the runtime error output
+    :env    possibly nested map of values to merge with the initial environment"
+  ^EditorExtensionsRuntime [project & {:keys [out err env] :or {out *out* err *err*}}]
   (let [project-path (g/with-auto-evaluation-context evaluation-context
                        (-> project
                            (project/workspace evaluation-context)
@@ -166,46 +211,50 @@
         package-lib (PackageLib.)
         ;; We don't need to hold the lock on a LuaVM here because we are
         ;; creating it and no other thread can access it yet
-        env (doto (vm/env vm)
-              (.load (DefoldBaseLib. #(find-resource project %)))
-              (.load package-lib)
-              (.load (Bit32Lib.))
-              (.load (TableLib.))
-              (.load (StringLib.))
-              (.load (CoroutineLib.))
-              (.load (JseMathLib.))
-              (.load (DefoldIoLib. #(resolve-file project-path %)))
-              (.load (JseOsLib.))
-              (LoadState/install)
-              (LuaC/install)
-              (-> .-STDOUT (set! (writer->print-stream out)))
-              (-> .-STDERR (set! (writer->print-stream err))))
-        package (.get env "package")
+        globals (doto (vm/env vm)
+                  (.load (DefoldBaseLib. #(find-resource project %)))
+                  (.load package-lib)
+                  (.load (Bit32Lib.))
+                  (.load (TableLib.))
+                  (.load (StringLib.))
+                  (.load (CoroutineLib.))
+                  (.load (JseMathLib.))
+                  (.load (DefoldIoLib. #(resolve-file project-path %)))
+                  (.load (JseOsLib.))
+                  (LoadState/install)
+                  (LuaC/install)
+                  (-> .-STDOUT (set! (writer->print-stream out)))
+                  (-> .-STDERR (set! (writer->print-stream err))))
+        package (.get globals "package")
         ;; Before splitting the coroutine module into 2 contexts (user and
         ;; system), we override the coroutine.create() function with a one that
         ;; conveys the thread bindings to the coroutine thread. This way, both
         ;; in system and user coroutines, the *execution-context* var will be
         ;; properly set.
-        _ (-> env (.get "coroutine") (.set "create" (DefoldCoroutineCreate. env)))
+        _ (doto (.get globals "coroutine")
+            (.set "create" (DefoldCoroutineCreate. globals))
+            (.set "yield" (DefoldCoroutineYield. globals)))
 
         ;; Now we split the coroutine into 2 contexts
         coronest (vm/eval coronest-prototype vm)
-        user-coroutine (vm/invoke-1 vm coronest (vm/->lua "user"))
-        system-coroutine (vm/invoke-1 vm coronest (vm/->lua "system"))]
+        user-coroutine (vm/invoke-1 vm coronest (->lua "user"))
+        system-coroutine (vm/invoke-1 vm coronest (->lua "system"))]
 
     ;; Don't allow requiring java classes
-    (.set package "searchers" (vm/->lua [(PackageLib$preload_searcher. package-lib)
-                                         (PackageLib$lua_searcher. package-lib)]))
+    (.set package "searchers" (->lua [(PackageLib$preload_searcher. package-lib)
+                                      (PackageLib$lua_searcher. package-lib)]))
 
     ;; Override coroutine as configured by CoroutineLib with user coroutine context
-    (.set env "coroutine" user-coroutine)
+    (.set globals "coroutine" user-coroutine)
     (-> package (.get "loaded") (.set "coroutine" user-coroutine))
 
     ;; Always use forward slashes for resource path separators
-    (.set package "searchpath" (SearchPath. env))
+    (.set package "searchpath" (SearchPath. globals))
 
     ;; Missing in luaj 3.0.1
     (.set package "config" (str File/separatorChar "\n;\n?\n!\n-"))
+
+    (merge-env-impl! globals env)
 
     (EditorExtensionsRuntime.
       vm
@@ -214,24 +263,22 @@
       (.get system-coroutine "status")
       (.get system-coroutine "yield"))))
 
-(def ^:private lua-str-dead (vm/->lua "dead"))
+(def ^:private lua-str-dead (->lua "dead"))
 
-(defn- invoke-suspending-impl [execution-context ^EditorExtensionsRuntime runtime co lua-value]
+(defn- invoke-suspending-impl [execution-context ^EditorExtensionsRuntime runtime co & lua-args]
   (binding [*execution-context* execution-context]
     (let [vm (.-lua-vm runtime)
-          [lua-success lua-ret] (vm/invoke-all vm (.-resume runtime) co lua-value)]
-      (if (vm/->clj lua-success vm)
+          [lua-success lua-ret] (apply vm/invoke-all vm (.-resume runtime) co lua-args)]
+      (if (->clj runtime lua-success)
         (if (= lua-str-dead (vm/invoke-1 vm (.-status runtime) co))
           (future/completed lua-ret)
-          (let [^Suspend suspend (vm/->clj lua-ret vm)]
+          (let [^Suspend suspend (->clj runtime lua-ret)]
             (-> (try
                   (apply (.-f suspend) (.-args suspend))
                   (catch LuaError e (future/completed (suspend-result-error e)))
                   (catch Throwable e (future/failed e)))
                 (future/then-compose-async
                   (fn [^SuspendResult result]
-                    ;; This is executed asynchronously, no execution context is
-                    ;; set here
                     (if (.-refresh-context result)
                       (do
                         (fx/on-fx-thread
@@ -240,9 +287,9 @@
                           {:evaluation-context (g/make-evaluation-context)
                            :runtime runtime
                            :mode :suspendable}
-                          runtime co (vm/->lua result)))
-                      (invoke-suspending-impl execution-context runtime co (vm/->lua result))))))))
-        (future/failed (LuaError. ^String (vm/->clj lua-ret vm)))))))
+                          runtime co (->lua result)))
+                      (invoke-suspending-impl execution-context runtime co (->lua result))))))))
+        (future/failed (LuaError. ^String (->clj runtime lua-ret)))))))
 
 (defn invoke-suspending
   "Invoke a potentially long-running LuaFunction
@@ -254,12 +301,12 @@
   Runtime will start invoking the LueFunction on the calling thread, then will
   move the execution to background threads if necessary. This means that
   invoke-suspending might return a completed CompletableFuture"
-  [^EditorExtensionsRuntime runtime lua-fn lua-value]
+  [^EditorExtensionsRuntime runtime lua-fn & lua-args]
   (let [co (vm/invoke-1 (.-lua-vm runtime) (.-create runtime) lua-fn)
         execution-context {:evaluation-context (g/make-evaluation-context)
                            :runtime runtime
                            :mode :suspendable}]
-    (invoke-suspending-impl execution-context runtime co lua-value)))
+    (apply invoke-suspending-impl execution-context runtime co lua-args)))
 
 (defn invoke-immediate
   "Invoke a short-running LuaFunction
@@ -267,18 +314,30 @@
   Returns the result LuaValue. No calls to suspending functions are allowed
   during this invocation. Calling this function might throw an exception. If the
   exception is LuaError, treat is a script error. Otherwise, treat it as editor
-  error."
-  ([runtime lua-fn lua-value]
-   (g/with-auto-evaluation-context evaluation-context
-     (invoke-immediate runtime lua-fn lua-value evaluation-context)))
-  ([^EditorExtensionsRuntime runtime lua-fn lua-value evaluation-context]
-   (binding [*execution-context* {:evaluation-context evaluation-context
-                                  :runtime runtime
-                                  :mode :immediate}]
-     (vm/invoke-1 (.-lua-vm runtime) lua-fn lua-value))))
+  error.
+
+  Args:
+    runtime                the editor Lua runtime
+    lua-fn                 LuaFunction to invoke
+    args*                  0 or more LuaValue arguments
+    evaluation-context?    optional evaluation context for the execution"
+  {:arglists '([runtime lua-fn args* evaluation-context?])}
+  [^EditorExtensionsRuntime runtime lua-fn & rest-args]
+  (let [last-arg (last rest-args)
+        context-provided (and (map? last-arg) (contains? last-arg :basis))
+        evaluation-context (if context-provided last-arg (g/make-evaluation-context))
+        lua-args (if context-provided (butlast rest-args) rest-args)
+        result (binding [*execution-context* {:evaluation-context evaluation-context
+                                              :runtime runtime
+                                              :mode :immediate}]
+                 (apply vm/invoke-1 (.-lua-vm runtime) lua-fn lua-args))]
+    (when-not context-provided
+      (g/update-cache-from-evaluation-context! evaluation-context))
+    result))
 
 (comment
 
+  ;; I AM HERE!
   ;; TODO:
   ;;   1. Create tests for the runtime that ensure that it runs correctly in a
   ;;      multi-threaded environment
@@ -291,12 +350,12 @@
                         (vm/eval vm))
         fast-lua-fn (-> (vm/read "return function(x) glob = glob + 1 return x end")
                         (vm/eval vm))
-        slow (invoke-suspending runtime slow-lua-fn (vm/->lua 4))]
+        slow (invoke-suspending runtime slow-lua-fn (->lua 4))]
     (dotimes [_ 100]
       (future
         (dotimes [_ 100000]
-          (invoke-immediate runtime fast-lua-fn (vm/->lua 4)))))
-    (tap> [:slow (vm/->clj (time @slow) vm)]))
+          (invoke-immediate runtime fast-lua-fn (->lua 4)))))
+    (tap> [:slow (->clj runtime (time @slow))]))
 
   (System/gc)
 
@@ -309,7 +368,7 @@
     (time
       (g/with-auto-evaluation-context ec
         (dotimes [_ 1000000]
-          (invoke-immediate runtime lua-fn (vm/->lua 4) ec)))))
+          (invoke-immediate runtime lua-fn (->lua 4) ec)))))
 
   (format "%f" (double (/ 400 1000000))) ;; 0.0004ms per noop
 
@@ -321,7 +380,7 @@
                                return {s,v}
                              end")
                    (vm/eval vm))]
-    (vm/->clj @(invoke-suspending runtime lua-fn (vm/->lua "ext/other.lua")) vm))
+    (vm/->clj @(invoke-suspending runtime lua-fn (->lua "ext/other.lua")) vm))
 
   (let [runtime (make (dev/project))
         vm (.-lua-vm runtime)
@@ -330,6 +389,6 @@
                                return {v, ret}
                              end")
                    (vm/eval vm))]
-    (vm/->clj (invoke-immediate runtime lua-fn (vm/->lua "ext/other.lua")) vm))
+    (->clj runtime (invoke-immediate runtime lua-fn (->lua "ext/other.lua"))))
 
   #__)

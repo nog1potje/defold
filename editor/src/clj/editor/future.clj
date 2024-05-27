@@ -24,21 +24,17 @@
   [^CompletableFuture future ex]
   (doto future (.completeExceptionally ex)))
 
+(defn done? [^CompletableFuture future]
+  (.isDone future))
+
 (defn complete!
   [^CompletableFuture future x]
   (doto future (.complete x)))
 
-(defn then
-  ^CompletableFuture [^CompletableFuture future f]
-  (.thenApply future (reify Function (apply [_ x] (f x)))))
-
-(defn then-async
-  [^CompletableFuture future f]
-  (.thenApplyAsync future (reify Function (apply [_ x] (f x)))))
-
 (defn then-compose-async
   [^CompletableFuture future f]
-  (.thenComposeAsync future (reify Function (apply [_ x] (f x)))))
+  (let [f (bound-fn* f)]
+    (.thenComposeAsync future (reify Function (apply [_ x] (f x))))))
 
 (defn catch [^CompletableFuture future f]
   (.exceptionally
