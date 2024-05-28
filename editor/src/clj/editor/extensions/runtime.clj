@@ -58,7 +58,7 @@
            [java.nio.charset StandardCharsets]
            [java.nio.file Path]
            [org.apache.commons.io.output WriterOutputStream]
-           [org.luaj.vm2 LoadState LuaError LuaFunction LuaValue]
+           [org.luaj.vm2 LoadState LuaFunction LuaValue]
            [org.luaj.vm2.compiler LuaC]
            [org.luaj.vm2.lib Bit32Lib CoroutineLib PackageLib PackageLib$lua_searcher PackageLib$preload_searcher StringLib TableLib]
            [org.luaj.vm2.lib.jse JseMathLib JseOsLib]))
@@ -80,8 +80,8 @@
   Object
   (deliver-result [x] (vm/->lua x))
   (refresh-context? [_] false)
-  LuaError
-  (deliver-result [error] (throw error))
+  Exception
+  (deliver-result [ex] (throw ex))
   (refresh-context? [_] false))
 
 (defn and-refresh-context
@@ -127,7 +127,7 @@
     (fn [& args]
       (let [ctx (current-execution-context)]
         (if (= :immediate (:mode ctx))
-          (throw (LuaError. "Cannot use long-running editor function in immediate context")))
+          (throw (RuntimeException. "Cannot use long-running editor function in immediate context")))
         (let [^EditorExtensionsRuntime runtime (:runtime ctx)
               vm (.-lua-vm runtime)
               suspend (Suspend. f args)]
@@ -138,14 +138,13 @@
 
   The function will receive LuaValue args that were passed by the editor script.
   The function should either:
-  - throw LuaError to signal an error to the script
-  - throw other Exception to signal editor error
-  - return any value - if LuaError, it will be signaled as an error to the
+  - throw Exception to signal a script error
+  - return any value - if Exception, it will be signaled as an error to the
     script, otherwise it will be coerced to LuaValue and delivered as a result
   - return a value as above, additionally wrapped using and-refresh-context to
     instruct the runtime to refresh the execution (evaluation) context of the
     running script
-  - any of the above, but delivered asynchronously a CompletableFuture
+  - any of the above, but delivered asynchronously using a CompletableFuture
 
   Returned function will be executed in an execution context that can be
   accessed using current-execution-context fn"
@@ -157,8 +156,7 @@
 
   The function will receive LuaValue args that were passed by the editor script.
   Returned value will be coerced to LuaValue. If the returned value is already a
-  LuaValue, it will be left as is. Thrown LuaErrors are editor script errors,
-  other thrown exceptions are editor errors
+  LuaValue, it will be left as is.
 
   Returned function will be executed in an execution context that can be
   accessed using current-execution-context fn"
@@ -174,7 +172,7 @@
   (let [target-path (.normalize (.resolve project-path file-path))]
     (if (.startsWith target-path project-path)
       (str target-path)
-      (throw (LuaError. (format "Can't open %s: outside of project directory" file-path))))))
+      (throw (IllegalArgumentException. (format "Can't open %s: outside of project directory" file-path))))))
 
 (defn read
   "Read a string with a chunk of lua code and return a Prototype for bind"
@@ -297,8 +295,8 @@
                   (apply (.-f suspend) (.-args suspend))
                   (catch Throwable e (future/failed e)))
                 future/wrap
-                ;; treat thrown LuaErrors as error signals to the scripts
-                (future/catch #(if (instance? LuaError %) % (throw %)))
+                ;; treat thrown Exceptions as error signals to the scripts
+                (future/catch identity)
                 (future/then-compose-async
                   (fn [result]
                     (if (refresh-context? result)
@@ -309,16 +307,15 @@
                         (fx/on-fx-thread (update-cache! (:evaluation-context execution-context)))
                         (invoke-suspending-impl new-context runtime co (vm/wrap-userdata result)))
                       (invoke-suspending-impl execution-context runtime co (vm/wrap-userdata result))))))))
-        (future/failed (LuaError. ^String (->clj runtime lua-ret)))))))
+        (future/failed (RuntimeException. ^String (->clj runtime lua-ret)))))))
 
 (defn invoke-suspending
   "Invoke a potentially long-running LuaFunction
 
   Returns a CompletableFuture that will be either completed normally with the
-  returned LuaValue or exceptionally. If exception is LuaError, treat it as a
-  script error. Otherwise, treat it as editor error.
+  returned LuaValue or exceptionally.
 
-  Runtime will start invoking the LueFunction on the calling thread, then will
+  Runtime will start invoking the LuaFunction on the calling thread, then will
   move the execution to background threads if necessary. This means that
   invoke-suspending might return a completed CompletableFuture"
   [^EditorExtensionsRuntime runtime lua-fn & lua-args]
@@ -332,9 +329,7 @@
   "Invoke a short-running LuaFunction
 
   Returns the result LuaValue. No calls to suspending functions are allowed
-  during this invocation. Calling this function might throw an exception. If the
-  exception is LuaError, treat is a script error. Otherwise, treat it as editor
-  error.
+  during this invocation.
 
   Args:
     runtime                the editor Lua runtime
@@ -358,8 +353,6 @@
 (comment
 
   ;; TODO:
-  ;;   1. Create tests for the runtime that ensure that it runs correctly in a
-  ;;      multi-threaded environment
   ;;   2. Create extensions namespace that creates and configures the runtime
   ;;   3. Port current implementation
 

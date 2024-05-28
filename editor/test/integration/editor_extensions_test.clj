@@ -220,10 +220,21 @@
               [false "failed async"]]
              (rt/->clj rt @(rt/invoke-suspending rt lua-fn)))))))
 
-(deftest non-lua-errors-are-reported-es-editor-errors
+(deftest immediate-failures-test
   (test-util/with-loaded-project
-    (let [rt (rt/make project :env {"suspend_editor_error" (rt/suspendable-lua-fn []
-                                                             (throw (Exception. "Not a LuaError")))})
-          f (rt/invoke-suspending rt (rt/bind rt (rt/read "return pcall(suspend_editor_error)")))]
-      (when (is (future/done? f))
-        (is (thrown-with-msg? Exception #"Not a LuaError" @f))))))
+    (let [rt (rt/make project :env {"immediate_error" (rt/lua-fn []
+                                                        (throw (Exception. "fail")))
+                                    "suspend_error" (rt/suspendable-lua-fn []
+                                                      "success")})]
+      (is
+        (= [[false "fail"]
+            [false "Cannot use long-running editor function in immediate context"]]
+           (->> (rt/read "local success1, result1 = pcall(immediate_error)
+                          local success2, result2 = pcall(suspend_error)
+                          return {
+                            {success1, result1},
+                            {success2, result2}
+                          }")
+                (rt/bind rt)
+                (rt/invoke-immediate rt)
+                (rt/->clj rt)))))))
