@@ -22,18 +22,18 @@
             [integration.test-util :as test-util])
   (:import [org.luaj.vm2 LuaError]))
 
-(deftest eval-test
+(deftest read-bind-test
   (test-util/with-loaded-project
     (let [rt (rt/make project)
           p (rt/read "return 1")]
-      (= 1 (rt/->clj rt (rt/eval rt p))))))
+      (= 1 (rt/->clj rt (rt/invoke-immediate rt (rt/bind rt p)))))))
 
 (deftest thread-safe-access-test
   (test-util/with-loaded-project
     (let [rt (rt/make project)
-          _ (rt/eval rt (rt/read "global = 1"))
+          _ (rt/invoke-immediate rt (rt/bind rt (rt/read "global = 1")))
           inc-and-get (rt/read "return function () global = global + 1; return global end")
-          lua-inc-and-get (rt/eval rt inc-and-get)
+          lua-inc-and-get (rt/invoke-immediate rt (rt/bind rt inc-and-get))
           ec (g/make-evaluation-context)
           threads 10
           per-thread-calls 1000
@@ -56,8 +56,8 @@
           rt (rt/make project
                       :env {"suspend_with_promise" (rt/suspendable-lua-fn [] completable-future)
                             "no_suspend" (rt/lua-fn [] (rt/->lua "immediate-result"))})
-          calls-suspending (rt/eval rt (rt/read "return function() return suspend_with_promise() end "))
-          calls-immediate (rt/eval rt (rt/read "return function() return no_suspend() end"))
+          calls-suspending (rt/invoke-immediate rt (rt/bind rt (rt/read "return function() return suspend_with_promise() end ")))
+          calls-immediate (rt/invoke-immediate rt (rt/bind rt (rt/read "return function() return no_suspend() end")))
           suspended-future (rt/invoke-suspending rt calls-suspending)]
       (is (false? (future/done? completable-future)))
       (is (= "immediate-result" (rt/->clj rt (rt/invoke-immediate rt calls-immediate))))
@@ -68,22 +68,26 @@
 (deftest suspending-calls-without-suspensions-complete-immediately
   (test-util/with-loaded-project
     (let [rt (rt/make project)
-          lua-fib (rt/eval rt (rt/read "local function fib(n)
-                                          if n <= 1 then
-                                            return n
-                                          else
-                                            return fib(n - 1) + fib(n - 2)
-                                          end
-                                        end
+          lua-fib (->> (rt/read "local function fib(n)
+                                   if n <= 1 then
+                                     return n
+                                   else
+                                     return fib(n - 1) + fib(n - 2)
+                                   end
+                                 end
 
-                                        return fib"))]
+                                 return fib")
+                       (rt/bind rt)
+                       (rt/invoke-immediate rt))]
       ;; 30th fibonacci takes awhile to complete, but still done immediately
       (is (future/done? (rt/invoke-suspending rt lua-fib (rt/->lua 30)))))))
 
 (deftest suspending-calls-in-immediate-mode-are-disallowed
   (test-util/with-loaded-project
     (let [rt (rt/make project :env {"suspending" (rt/suspendable-lua-fn [] (future/make))})
-          calls-suspending (rt/eval rt (rt/read "return function () suspending() end"))]
+          calls-suspending (->> (rt/read "return function () suspending() end")
+                                (rt/bind rt)
+                                (rt/invoke-immediate rt))]
       (is (thrown-with-msg?
             LuaError
             #"Cannot use long-running editor function in immediate context"
@@ -94,25 +98,27 @@
     (let [rt (rt/make project :env {"suspending" (rt/suspendable-lua-fn [x]
                                                    (let [rt (:runtime (rt/current-execution-context))]
                                                      (inc (rt/->clj rt x))))})
-          coromix (rt/eval rt (rt/read "local function yield_twice(x)
-                                          local y = coroutine.yield(suspending(x))
-                                          coroutine.yield(suspending(y))
-                                          return 'done'
-                                        end
+          coromix (->> (rt/read "local function yield_twice(x)
+                                   local y = coroutine.yield(suspending(x))
+                                   coroutine.yield(suspending(y))
+                                   return 'done'
+                                 end
 
-                                        return function(n)
-                                          local co = coroutine.create(yield_twice)
-                                          local success1, result1 = coroutine.resume(co, n)
-                                          local success2, result2 = coroutine.resume(co, result1)
-                                          local success3, result3 = coroutine.resume(co, result2)
-                                          local success4, result4 = coroutine.resume(co, result2)
-                                          return {
-                                            {success1, result1},
-                                            {success2, result2},
-                                            {success3, result3},
-                                            {success4, result4},
-                                          }
-                                        end"))]
+                                 return function(n)
+                                   local co = coroutine.create(yield_twice)
+                                   local success1, result1 = coroutine.resume(co, n)
+                                   local success2, result2 = coroutine.resume(co, result1)
+                                   local success3, result3 = coroutine.resume(co, result2)
+                                   local success4, result4 = coroutine.resume(co, result2)
+                                   return {
+                                     {success1, result1},
+                                     {success2, result2},
+                                     {success3, result3},
+                                     {success4, result4},
+                                   }
+                                 end")
+                       (rt/bind rt)
+                       (rt/invoke-immediate rt))]
       (is (= [;; first yield: incremented input
               [true 6]
               ;; second yield: incremented again
@@ -126,25 +132,27 @@
 (deftest user-coroutines-work-normally-in-immediate-mode
   (test-util/with-loaded-project
     (let [rt (rt/make project)
-          lua-fn (rt/eval rt (rt/read "local function yields_twice()
-                                         coroutine.yield(1)
-                                         coroutine.yield(2)
-                                         return 'done'
-                                       end
+          lua-fn (->> (rt/read "local function yields_twice()
+                                  coroutine.yield(1)
+                                  coroutine.yield(2)
+                                  return 'done'
+                                end
 
-                                       return function()
-                                         local co = coroutine.create(yields_twice)
-                                         local success1, result1 = coroutine.resume(co)
-                                         local success2, result2 = coroutine.resume(co)
-                                         local success3, result3 = coroutine.resume(co)
-                                         local success4, result4 = coroutine.resume(co)
-                                         return {
-                                           {success1, result1},
-                                           {success2, result2},
-                                           {success3, result3},
-                                           {success4, result4},
-                                         }
-                                       end"))]
+                                return function()
+                                  local co = coroutine.create(yields_twice)
+                                  local success1, result1 = coroutine.resume(co)
+                                  local success2, result2 = coroutine.resume(co)
+                                  local success3, result3 = coroutine.resume(co)
+                                  local success4, result4 = coroutine.resume(co)
+                                  return {
+                                    {success1, result1},
+                                    {success2, result2},
+                                    {success3, result3},
+                                    {success4, result4},
+                                  }
+                                end")
+                      (rt/bind rt)
+                      (rt/invoke-immediate rt))]
       (is (= [;; first yield: 1
               [true 1]
               ;; second yield: 2
@@ -175,12 +183,14 @@
                                                 (set-val!)
                                                 (future/complete! f (rt/and-refresh-context true))))
                                             f))})
-          lua-fn (rt/eval rt (rt/read "return function()
-                                         local v1 = get_value()
-                                         local change_result = set_value(2)
-                                         local v2 = get_value()
-                                         return {v1, change_result, v2}
-                                       end"))]
+          lua-fn (->> (rt/read "return function()
+                                  local v1 = get_value()
+                                  local change_result = set_value(2)
+                                  local v2 = get_value()
+                                  return {v1, change_result, v2}
+                                end")
+                      (rt/bind rt)
+                      (rt/invoke-immediate rt))]
       (is (= [;; initial value
               1
               ;; success notification about change
@@ -196,15 +206,24 @@
                                                                  (throw (LuaError. "failed immediately")))
                                     "suspend_fail_async" (rt/suspendable-lua-fn []
                                                            (future/failed (LuaError. "failed async")))})
-          lua-fn (rt/eval rt (rt/read "return function()
-                                         local success1, value1 = pcall(suspend_fail_immediately)
-                                         local success2, value2 = pcall(suspend_fail_async)
-                                         return {
-                                           {success1, value1},
-                                           {success2, value2},
-                                         }
-                                       end"))]
+          lua-fn (->> (rt/read "return function()
+                                  local success1, value1 = pcall(suspend_fail_immediately)
+                                  local success2, value2 = pcall(suspend_fail_async)
+                                  return {
+                                    {success1, value1},
+                                    {success2, value2},
+                                  }
+                                end")
+                      (rt/bind rt)
+                      (rt/invoke-immediate rt))]
       (is (= [[false "failed immediately"]
               [false "failed async"]]
              (rt/->clj rt @(rt/invoke-suspending rt lua-fn)))))))
 
+(deftest non-lua-errors-are-reported-es-editor-errors
+  (test-util/with-loaded-project
+    (let [rt (rt/make project :env {"suspend_editor_error" (rt/suspendable-lua-fn []
+                                                             (throw (Exception. "Not a LuaError")))})
+          f (rt/invoke-suspending rt (rt/bind rt (rt/read "return pcall(suspend_editor_error)")))]
+      (when (is (future/done? f))
+        (is (thrown-with-msg? Exception #"Not a LuaError" @f))))))

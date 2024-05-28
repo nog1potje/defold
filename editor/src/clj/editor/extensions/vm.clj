@@ -25,7 +25,7 @@
   Lua script that uses coroutines. The with-lock macro is aware of this and will
   not actually lock in coroutine threads. We trust luaj coroutines to
   multi-thread safely in coroutines."
-  (:refer-clojure :exclude [eval read])
+  (:refer-clojure :exclude [read])
   (:import [clojure.lang Named]
            [java.io ByteArrayInputStream]
            [java.nio.charset StandardCharsets]
@@ -37,7 +37,7 @@
 (set! *warn-on-reflection* true)
 
 (defn read
-  "Read a string with a chunk of lua code and return a Prototype for eval"
+  "Read a string with a chunk of lua code and return a Prototype for bind"
   ^Prototype [chunk chunk-name]
   (.compile LuaC/instance
             (ByteArrayInputStream. (.getBytes ^String chunk StandardCharsets/UTF_8))
@@ -56,6 +56,12 @@
   "Return lock used for synchronising access to this VM"
   [^LuaVM vm]
   (.-lock vm))
+
+(defn bind
+  "Bind a prototype into the VM, returns a 0-arg LuaFunction that evaluates the
+  prototype code when invoked"
+  [prototype vm]
+  (LuaClosure. prototype (env vm)))
 
 (defn must-lock?
   "Checks if the current thread must lock the VM when interacting with it"
@@ -79,11 +85,6 @@
   See org.luaj.vm2.lib.jse.JsePlatform/standardGlobals for typical setup"
   []
   (LuaVM. (Globals.) (ReentrantLock.)))
-
-(defn eval
-  "Evaluate the Prototype produced by read and return resulting LuaValue"
-  ^LuaValue [prototype vm]
-  (with-lock vm (.call (LuaClosure. prototype (env vm)))))
 
 (defn- invoke ^Varargs [vm ^LuaFunction lua-fn args]
   (with-lock vm (.invoke lua-fn (LuaValue/varargsOf (into-array LuaValue args)))))

@@ -33,8 +33,18 @@
        it to use suspendable functions defined by the editor.
     2. invoke-immediate - call the LuaFunction with suspendable functions
        defined by the editor disabled. This way there is no coroutine overhead,
-       and code executes significantly faster."
-  (:refer-clojure :exclude [eval read])
+       and code executes significantly faster.
+
+  Lua code evaluation is done using read / bind / invoke-{suspending,immediate}
+  cycle:
+    - read takes a string of Lua code and compiles it into a reusable prototype
+    - bind takes a prototype and creates a 0-arg Lua function (a closure), that,
+      when invoked, will evaluate the code in the runtime
+    - invoke-{suspending,immediate} will actually evaluate the code.
+  We split 'eval' into 'bind' and 'invoke-{suspending,immediate}' because there
+  are different evaluation semantics for invoke-suspending and invoke-immediate
+  that the users of the runtime need to choose."
+  (:refer-clojure :exclude [read])
   (:require [cljfx.api :as fx]
             [clojure.java.io :as io]
             [dynamo.graph :as g]
@@ -74,7 +84,11 @@
   (deliver-result [error] (throw error))
   (refresh-context? [_] false))
 
-(defn and-refresh-context [result]
+(defn and-refresh-context
+  "Given a value delivered from the suspendable function to the Lua runtime,
+  instruct the runtime to refresh the execution context before delivering the
+  result to the editor script"
+  [result]
   (reify SuspensionResult
     (deliver-result [_] (deliver-result result))
     (refresh-context? [_] true)))
@@ -120,12 +134,18 @@
           (deliver-result (vm/unwrap-userdata (vm/invoke-1 vm (.-yield runtime) (->lua suspend)))))))))
 
 (defmacro suspendable-lua-fn
-  ;; todo fix doc
   "Defines a suspendable Lua function
 
   The function will receive LuaValue args that were passed by the editor script.
-  It must return a future that will eventually be completed with a suspend
-  result.
+  The function should either:
+  - throw LuaError to signal an error to the script
+  - throw other Exception to signal editor error
+  - return any value - if LuaError, it will be signaled as an error to the
+    script, otherwise it will be coerced to LuaValue and delivered as a result
+  - return a value as above, additionally wrapped using and-refresh-context to
+    instruct the runtime to refresh the execution (evaluation) context of the
+    running script
+  - any of the above, but delivered asynchronously a CompletableFuture
 
   Returned function will be executed in an execution context that can be
   accessed using current-execution-context fn"
@@ -137,7 +157,8 @@
 
   The function will receive LuaValue args that were passed by the editor script.
   Returned value will be coerced to LuaValue. If the returned value is already a
-  LuaValue, it will be left as is.
+  LuaValue, it will be left as is. Thrown LuaErrors are editor script errors,
+  other thrown exceptions are editor errors
 
   Returned function will be executed in an execution context that can be
   accessed using current-execution-context fn"
@@ -156,7 +177,7 @@
       (throw (LuaError. (format "Can't open %s: outside of project directory" file-path))))))
 
 (defn read
-  "Read a string with a chunk of lua code and return a Prototype for eval"
+  "Read a string with a chunk of lua code and return a Prototype for bind"
   ([chunk]
    (vm/read chunk "REPL"))
   ([chunk chunk-name]
@@ -165,13 +186,18 @@
 (def ^:private coronest-prototype
   (read (slurp (io/resource "coronest.lua")) "coronest.lua"))
 
-(defn eval
-  "Evaluate the Prototype produced by read and return resulting LuaValue"
-  ^LuaValue [^EditorExtensionsRuntime runtime prototype]
-  (vm/eval prototype (.-lua-vm runtime)))
+(defn bind
+  "Bind a prototype to the runtime
+
+  Returns 0-arg LuaFunction (closure) that evaluates the prototype Lua code in
+  this runtime when invoked. Does not execute the code by itself"
+  ^LuaFunction [^EditorExtensionsRuntime runtime prototype]
+  (vm/bind prototype (.-lua-vm runtime)))
 
 (defn- writer->print-stream [^Writer writer]
-  (PrintStream. (WriterOutputStream. writer StandardCharsets/UTF_8) true StandardCharsets/UTF_8))
+  (-> writer
+      (WriterOutputStream. StandardCharsets/UTF_8)
+      (PrintStream. true StandardCharsets/UTF_8)))
 
 (defn- merge-env-impl! [globals m]
   (reduce-kv
@@ -230,7 +256,7 @@
             (.set "yield" (DefoldCoroutine$Yield. globals)))
 
         ;; Now we split the coroutine into 2 contexts
-        coronest (vm/eval coronest-prototype vm)
+        coronest (vm/invoke-1 vm (vm/bind coronest-prototype vm))
         user-coroutine (vm/invoke-1 vm coronest (->lua "user"))
         system-coroutine (vm/invoke-1 vm coronest (->lua "system"))]
 
