@@ -1,17 +1,11 @@
 (ns editor.future
   (:refer-clojure :exclude [future])
   (:import [java.util.concurrent CompletableFuture CompletionException]
-           [java.util.function Supplier Function]))
+           [java.util.function Function]))
 
 (defn make
-  (^CompletableFuture []
-   (CompletableFuture.))
-  (^CompletableFuture [f]
-   (CompletableFuture/supplyAsync (reify Supplier (get [_] (f))))))
-
-(defmacro supply-async [& body]
-  ;; todo thread bindings!
-  `(CompletableFuture/supplyAsync (reify Supplier (get [~'_] ~@body))))
+  ^CompletableFuture []
+  (CompletableFuture.))
 
 (defn completed
   ^CompletableFuture [x]
