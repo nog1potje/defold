@@ -34,7 +34,7 @@
     2. invoke-immediate - call the LuaFunction with suspendable functions
        defined by the editor disabled. This way there is no coroutine overhead,
        and code executes significantly faster."
-  (:refer-clojure :exclude [read eval])
+  (:refer-clojure :exclude [eval read])
   (:require [cljfx.api :as fx]
             [clojure.java.io :as io]
             [dynamo.graph :as g]
@@ -43,13 +43,12 @@
             [editor.extensions.vm :as vm]
             [editor.future :as future]
             [editor.workspace :as workspace])
-  (:import [clojure.lang Var]
-           [com.defold.editor.luart DefoldBaseLib DefoldCoroutineCreate DefoldCoroutineYield DefoldIoLib DefoldVarArgFn SearchPath]
+  (:import [com.defold.editor.luart DefoldBaseLib DefoldCoroutine$Create DefoldCoroutine$Yield DefoldIoLib DefoldVarArgFn SearchPath]
            [java.io File PrintStream Writer]
            [java.nio.charset StandardCharsets]
            [java.nio.file Path]
            [org.apache.commons.io.output WriterOutputStream]
-           [org.luaj.vm2 LoadState LuaError LuaFunction LuaTable LuaValue]
+           [org.luaj.vm2 LoadState LuaError LuaFunction LuaValue]
            [org.luaj.vm2.compiler LuaC]
            [org.luaj.vm2.lib Bit32Lib CoroutineLib PackageLib PackageLib$lua_searcher PackageLib$preload_searcher StringLib TableLib]
            [org.luaj.vm2.lib.jse JseMathLib JseOsLib]))
@@ -232,8 +231,8 @@
         ;; in system and user coroutines, the *execution-context* var will be
         ;; properly set.
         _ (doto (.get globals "coroutine")
-            (.set "create" (DefoldCoroutineCreate. globals))
-            (.set "yield" (DefoldCoroutineYield. globals)))
+            (.set "create" (DefoldCoroutine$Create. globals))
+            (.set "yield" (DefoldCoroutine$Yield. globals)))
 
         ;; Now we split the coroutine into 2 contexts
         coronest (vm/eval coronest-prototype vm)
