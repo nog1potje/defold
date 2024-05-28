@@ -45,8 +45,8 @@
                                                (repeatedly per-thread-calls)
                                                (vec))))
                                       (repeatedly threads)
-                                      (vec) ;; launch all threads in parallel
-                                      (mapcat deref) ;; await
+                                      (vec)                 ;; launch all threads in parallel
+                                      (mapcat deref)        ;; await
                                       (map #(rt/->clj rt %)))))
           (throw (Exception. "Lua runtime is not thread-safe!")))))))
 
@@ -61,7 +61,7 @@
           suspended-future (rt/invoke-suspending rt calls-suspending)]
       (is (false? (future/done? completable-future)))
       (is (= "immediate-result" (rt/->clj rt (rt/invoke-immediate rt calls-immediate))))
-      (future/complete! completable-future (rt/suspend-result-success (rt/->lua "suspended-result") false))
+      (future/complete! completable-future "suspended-result")
       (when (is (true? (future/done? completable-future)))
         (is (= "suspended-result" (rt/->clj rt @suspended-future)))))))
 
@@ -92,9 +92,8 @@
 (deftest user-coroutines-are-separated-from-system-coroutines
   (test-util/with-loaded-project
     (let [rt (rt/make project :env {"suspending" (rt/suspendable-lua-fn [x]
-                                                                        (let [rt (:runtime (rt/current-execution-context))]
-                                                                          (future/completed
-                                                                            (rt/suspend-result-success (rt/->lua (inc (rt/->clj rt x))) false))))})
+                                                   (let [rt (:runtime (rt/current-execution-context))]
+                                                     (inc (rt/->clj rt x))))})
           coromix (rt/eval rt (rt/read "local function yield_twice(x)
                                           local y = coroutine.yield(suspending(x))
                                           coroutine.yield(suspending(y))
@@ -157,7 +156,8 @@
              (rt/->clj rt (rt/invoke-immediate rt lua-fn)))))))
 
 (g/defnode TestNode
-  (property value g/Any))
+  (property value g/Any)
+  (output value g/Any :cached (gu/passthrough value)))
 
 (deftest suspendable-functions-can-refresh-contexts
   (test-util/with-loaded-project
@@ -173,7 +173,7 @@
                                                              (g/set-property! node-id :value (rt/->clj rt n)))]
                                               (ui/run-later
                                                 (set-val!)
-                                                (future/complete! f (rt/suspend-result-success (rt/->lua true) true))))
+                                                (future/complete! f (rt/and-refresh-context true))))
                                             f))})
           lua-fn (rt/eval rt (rt/read "return function()
                                          local v1 = get_value()
@@ -189,7 +189,22 @@
               2]
              (rt/->clj rt @(rt/invoke-suspending rt lua-fn)))))))
 
-;; todo make suspend result a protocol extended to lua values, errors and special result that
-;;      forces a reload (even with error!)
 
-;; todo document and explain yield/create/resume situation
+(deftest suspending-lua-failure-test
+  (test-util/with-loaded-project
+    (let [rt (rt/make project :env {"suspend_fail_immediately" (rt/suspendable-lua-fn []
+                                                                 (throw (LuaError. "failed immediately")))
+                                    "suspend_fail_async" (rt/suspendable-lua-fn []
+                                                           (future/failed (LuaError. "failed async")))})
+          lua-fn (rt/eval rt (rt/read "return function()
+                                         local success1, value1 = pcall(suspend_fail_immediately)
+                                         local success2, value2 = pcall(suspend_fail_async)
+                                         return {
+                                           {success1, value1},
+                                           {success2, value2},
+                                         }
+                                       end"))]
+      (is (= [[false "failed immediately"]
+              [false "failed async"]]
+             (rt/->clj rt @(rt/invoke-suspending rt lua-fn)))))))
+

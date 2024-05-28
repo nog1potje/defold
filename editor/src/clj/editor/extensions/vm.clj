@@ -108,6 +108,16 @@
         (let [next-i (inc i)]
           (recur (conj! acc (.arg varargs next-i)) next-i))))))
 
+(defn wrap-userdata
+  "Wraps the value into a LuaUserdata"
+  [x]
+  (LuaValue/userdataOf x))
+
+(defn unwrap-userdata
+  "Returns the wrapped value"
+  [^LuaUserdata userdata]
+  (.userdata userdata))
+
 (defprotocol ->Lua
   (->lua [x]))
 

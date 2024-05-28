@@ -10,11 +10,17 @@
    (CompletableFuture/supplyAsync (reify Supplier (get [_] (f))))))
 
 (defmacro supply-async [& body]
+  ;; todo thread bindings!
   `(CompletableFuture/supplyAsync (reify Supplier (get [~'_] ~@body))))
 
 (defn completed
   ^CompletableFuture [x]
   (CompletableFuture/completedFuture x))
+
+(defn wrap [x]
+  (if (instance? CompletableFuture x)
+    x
+    (completed x)))
 
 (defn failed
   ^CompletableFuture [ex]
@@ -37,10 +43,11 @@
     (.thenComposeAsync future (reify Function (apply [_ x] (f x))))))
 
 (defn catch [^CompletableFuture future f]
-  (.exceptionally
-    future
-    (reify Function
-      (apply [_ ex]
-        (if (instance? CompletionException ex)
-          (f (.getCause ^CompletionException ex))
-          (f ex))))))
+  (let [f (bound-fn* f)]
+    (.exceptionally
+      future
+      (reify Function
+        (apply [_ ex]
+          (if (instance? CompletionException ex)
+            (f (.getCause ^CompletionException ex))
+            (f ex)))))))
